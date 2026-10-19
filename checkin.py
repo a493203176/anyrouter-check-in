@@ -245,11 +245,13 @@ def get_user_info(client, headers, user_info_url: str):
 				user_data = data.get('data', {})
 				quota = round(user_data.get('quota', 0) / 500000, 2)
 				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+				group = user_data.get('group') or user_data.get('group_name') or 'unknown'
 				return {
 					'success': True,
 					'quota': quota,
 					'used_quota': used_quota,
-					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+					'group': group,
+					'display': f':money: Current balance: ${quota}, Used: ${used_quota}, Group: {group}',
 				}
 		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
 	except Exception as e:
@@ -319,6 +321,7 @@ def format_check_in_notification(detail: dict) -> str:
 	"""格式化签到通知消息"""
 	lines = [
 		f'[CHECK-IN] {detail["name"]}',
+		f'  用户分组: {detail.get("group", "unknown")}',
 		'  ━━━━━━━━━━━━━━━━━━━━',
 		'  签到前',
 		f'     余额: ${detail["before_quota"]:.2f}  |  累计消耗: ${detail["before_used"]:.2f}',
@@ -538,6 +541,7 @@ async def main():
 					before_used = user_info_before['used_quota']
 					after_quota = user_info_after['quota']
 					after_used = user_info_after['used_quota']
+					group = user_info_after.get('group') or user_info_before.get('group') or 'unknown'
 
 					total_before = before_quota + before_used
 					total_after = after_quota + after_used
@@ -548,6 +552,7 @@ async def main():
 
 					account_check_in_details[account_key] = {
 						'name': account.get_display_name(i),
+						'group': group,
 						'before_quota': before_quota,
 						'before_used': before_used,
 						'after_quota': after_quota,
