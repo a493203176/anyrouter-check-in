@@ -409,6 +409,46 @@ async def is_logged_in(page: Page) -> bool:
 	return False
 
 
+async def _get_login_page_state(page: Page) -> dict:
+	"""获取失败页面的 URL、正文和可见表单，用于区分登录失败类型。"""
+	try:
+		state = await page.evaluate(
+			"""() => {
+				const isVisible = (el) => {
+					if (!el || !el.isConnected) return false;
+					const style = window.getComputedStyle(el);
+					if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) return false;
+					const rect = el.getBoundingClientRect();
+					return rect.width > 0 && rect.height > 0;
+				};
+				return {
+					title: document.title || '',
+					bodyText: (document.body?.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 500),
+					usernameVisible: isVisible(document.querySelector('#username')) || isVisible(document.querySelector('input[name="email"]')),
+					passwordVisible: isVisible(document.querySelector('#password')) || isVisible(document.querySelector('input[type="password"]')),
+					captchaVisible: [...document.querySelectorAll('iframe[src*="captcha"], iframe[src*="verify"], .nc-container, #nocaptcha')].some(isVisible),
+				};
+			}"""
+		)
+	except Exception as exc:  # nosec B110
+		state = {'error': str(exc)[:120]}
+	return {'url': page.url, **state}
+
+
+async def _wait_for_login_result(page: Page, timeout_ms: int) -> bool:
+	"""提交后等待页面离开登录表单；避免把仍停在登录页误判为成功。"""
+	deadline = time.monotonic() + timeout_ms / 1000
+	while time.monotonic() < deadline:
+		if await is_logged_in(page):
+			return True
+		if not await _is_email_form_visible(page):
+			await asyncio.sleep(1)
+			if await is_logged_in(page):
+				return True
+		await asyncio.sleep(0.5)
+	return await is_logged_in(page)
+
+
 async def wait_for_session_cookie(page: Page, timeout_ms: int = SESSION_WAIT_TIMEOUT_MS) -> bool:
 	deadline = time.monotonic() + timeout_ms / 1000
 	while time.monotonic() < deadline:
@@ -473,6 +513,8 @@ async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) ->
 	else:
 		debug_print(f'[WARN] Login verification failed: current URL={page.url}')
 		print('[WARN] Login verification failed')
+	state = await _get_login_page_state(page)
+	print(f'[INFO] Login page state: {state}')
 	return None
 
 
@@ -757,7 +799,8 @@ async def submit_login_form(page: Page, timeout_ms: int) -> None:
 		await submit.click(force=True, timeout=action_timeout)
 	await _wait_for_optional_load_state(page, 'domcontentloaded', action_timeout)
 	await _wait_for_optional_load_state(page, 'networkidle', min(timeout_ms, 30_000))
-	await wait_for_logged_in(page, SESSION_WAIT_TIMEOUT_MS)
+	if not await _wait_for_login_result(page, SESSION_WAIT_TIMEOUT_MS):
+		raise TimeoutError(f'Login form remained visible after submit: {await _get_login_page_state(page)}')
 
 
 async def login_with_email_form(

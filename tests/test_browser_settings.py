@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from utils.browser import launch_login_context, load_browser_login_settings
+from utils.browser import _get_login_page_state, launch_login_context, load_browser_login_settings
 
 
 def test_browser_login_settings_records_profile_persistence(monkeypatch, tmp_path):
@@ -13,6 +13,27 @@ def test_browser_login_settings_records_profile_persistence(monkeypatch, tmp_pat
 
 	assert settings.persist_profile is False
 	assert settings.profile_dir == tmp_path / 'agentrouter' / 'Account 1'
+
+
+@pytest.mark.asyncio
+async def test_get_login_page_state_includes_url_and_form_state():
+	class FakePage:
+		url = 'https://agentrouter.org/login'
+
+		async def evaluate(self, script):
+			return {
+				'title': 'Login',
+				'bodyText': 'Incorrect username or password',
+				'usernameVisible': True,
+				'passwordVisible': True,
+				'captchaVisible': False,
+			}
+
+	state = await _get_login_page_state(FakePage())
+
+	assert state['url'] == 'https://agentrouter.org/login'
+	assert state['usernameVisible'] is True
+	assert 'Incorrect username or password' in state['bodyText']
 
 
 @pytest.mark.asyncio
