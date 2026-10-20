@@ -793,14 +793,38 @@ async def submit_login_form(page: Page, timeout_ms: int) -> None:
 				continue
 	if not submit:
 		raise TimeoutError(f'Cannot find submit button: {SUBMIT_SELECTORS}')
+	login_response: dict = {}
+
+	async def record_login_response(response) -> None:
+		if login_response:
+			return
+		if '/api/user/login' not in response.url:
+			return
+		body = ''
+		try:
+			body = (await response.text())[:300]
+		except Exception:  # nosec B110
+			pass
+		login_response.update({'status': response.status, 'body': body})
+
+	page.on('response', record_login_response)
 	try:
-		await submit.click(timeout=action_timeout)
+		try:
+			await submit.click(timeout=action_timeout)
+		except Exception:
+			await submit.click(force=True, timeout=action_timeout)
+		await _wait_for_optional_load_state(page, 'domcontentloaded', action_timeout)
+		await _wait_for_optional_load_state(page, 'networkidle', min(timeout_ms, 30_000))
 	except Exception:
-		await submit.click(force=True, timeout=action_timeout)
-	await _wait_for_optional_load_state(page, 'domcontentloaded', action_timeout)
-	await _wait_for_optional_load_state(page, 'networkidle', min(timeout_ms, 30_000))
+		page.remove_listener('response', record_login_response)
+		raise
+
+	page.remove_listener('response', record_login_response)
 	if not await _wait_for_login_result(page, SESSION_WAIT_TIMEOUT_MS):
-		raise TimeoutError(f'Login form remained visible after submit: {await _get_login_page_state(page)}')
+		state = await _get_login_page_state(page)
+		if login_response:
+			state['loginResponse'] = login_response
+		raise TimeoutError(f'Login form remained visible after submit: {state}')
 
 
 async def login_with_email_form(

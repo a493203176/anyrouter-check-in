@@ -5,7 +5,7 @@ from types import SimpleNamespace
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from checkin import format_check_in_notification, generate_balance_hash, get_user_info
+from checkin import build_account_schedule, format_check_in_notification, generate_balance_hash, get_user_info
 
 
 class StubClient:
@@ -41,6 +41,21 @@ def test_balance_hash_is_stable_for_equivalent_balances():
 	}
 
 	assert generate_balance_hash(left) == generate_balance_hash(right)
+
+
+def test_build_account_schedule_can_shuffle_without_losing_original_indexes():
+	class StubRandom:
+		def shuffle(self, items):
+			items.reverse()
+
+	accounts = ['agent1', 'agent2', 'agent3']
+
+	assert build_account_schedule(accounts, shuffle=False) == [(0, 'agent1'), (1, 'agent2'), (2, 'agent3')]
+	assert build_account_schedule(accounts, shuffle=True, rng=StubRandom()) == [
+		(2, 'agent3'),
+		(1, 'agent2'),
+		(0, 'agent1'),
+	]
 
 
 def test_get_user_info_includes_group_in_display():

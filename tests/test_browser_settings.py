@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from utils.browser import _get_login_page_state, launch_login_context, load_browser_login_settings
+from utils.browser import _get_login_page_state, launch_login_context, load_browser_login_settings, submit_login_form
 
 
 def test_browser_login_settings_records_profile_persistence(monkeypatch, tmp_path):
@@ -34,6 +34,65 @@ async def test_get_login_page_state_includes_url_and_form_state():
 	assert state['url'] == 'https://agentrouter.org/login'
 	assert state['usernameVisible'] is True
 	assert 'Incorrect username or password' in state['bodyText']
+
+
+@pytest.mark.asyncio
+async def test_submit_login_form_reports_login_api_response(monkeypatch):
+	class FakeResponse:
+		url = 'https://agentrouter.org/api/user/login'
+		status = 200
+
+		async def text(self):
+			return '{"success":false,"message":"request rejected"}'
+
+	class FakeLocator:
+		@property
+		def first(self):
+			return self
+
+		async def wait_for(self, **kwargs):
+			return None
+
+		async def is_visible(self):
+			return True
+
+		async def click(self, **kwargs):
+			await page.handlers['response'](FakeResponse())
+
+	class FakePage:
+		url = 'https://agentrouter.org/login'
+
+		def __init__(self):
+			self.handlers = {}
+
+		def locator(self, selector):
+			return FakeLocator()
+
+		def on(self, event, handler):
+			self.handlers[event] = handler
+
+		def remove_listener(self, event, handler):
+			self.handlers.pop(event, None)
+
+		async def wait_for_load_state(self, *args, **kwargs):
+			return None
+
+		async def evaluate(self, script):
+			return {
+				'title': 'Login',
+				'bodyText': 'Username or email Password Continue',
+				'usernameVisible': True,
+				'passwordVisible': True,
+				'captchaVisible': False,
+			}
+
+	page = FakePage()
+	monkeypatch.setattr('utils.browser.SESSION_WAIT_TIMEOUT_MS', 1)
+
+	with pytest.raises(TimeoutError, match='loginResponse'):
+		await submit_login_form(page, 1)
+
+	assert 'response' not in page.handlers
 
 
 @pytest.mark.asyncio

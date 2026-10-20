@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import os
+import random
 import sys
 from datetime import datetime
 
@@ -41,6 +42,9 @@ from utils.proxy import get_playwright_proxy, get_proxy_server
 load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
+ACCOUNT_ORDER_ENV = 'CHECKIN_ACCOUNT_ORDER'
+ACCOUNT_RETRY_DELAY_ENV = 'CHECKIN_ACCOUNT_RETRY_DELAY_SECONDS'
+DEFAULT_ACCOUNT_RETRY_DELAY_SECONDS = 30
 
 
 def load_balance_hash():
@@ -61,6 +65,26 @@ def save_balance_hash(balance_hash):
 			f.write(balance_hash)
 	except Exception as e:
 		print(f'Warning: Failed to save balance hash: {e}')
+
+
+def build_account_schedule(accounts, *, shuffle: bool, rng=None):
+	"""返回 (原始索引, 账号) 顺序，原始索引用于保持余额缓存键稳定。"""
+	scheduled = list(enumerate(accounts))
+	if shuffle:
+		(rng or random).shuffle(scheduled)
+	return scheduled
+
+
+def account_retry_delay_seconds() -> int:
+	"""读取失败账号末尾重试前的等待时间。"""
+	raw = os.getenv(ACCOUNT_RETRY_DELAY_ENV, '').strip()
+	if not raw:
+		return DEFAULT_ACCOUNT_RETRY_DELAY_SECONDS
+	try:
+		return max(0, int(raw))
+	except ValueError:
+		print(f'[WARN] Invalid {ACCOUNT_RETRY_DELAY_ENV}={raw!r}, using {DEFAULT_ACCOUNT_RETRY_DELAY_SECONDS}s')
+		return DEFAULT_ACCOUNT_RETRY_DELAY_SECONDS
 
 
 def generate_balance_hash(balances):
@@ -507,77 +531,111 @@ async def main():
 	print(f'[INFO] Found {len(accounts)} account configurations')
 
 	last_balance_hash = load_balance_hash()
+	shuffle_accounts = os.getenv('CHECKIN_ACCOUNT_ORDER', 'random').strip().lower() != 'configured'
+	account_schedule = build_account_schedule(accounts, shuffle=shuffle_accounts)
+	if shuffle_accounts:
+		print('[INFO] Account order randomized; failed accounts will be retried after the first pass')
+	print(
+		f'[INFO] Account execution order: {", ".join(account.get_display_name(i) for i, account in account_schedule)}'
+	)
 
 	success_count = 0
 	total_count = len(accounts)
 	notification_content = []
+	failures_by_account = {}
 	current_balances = {}
 	account_check_in_details = {}
 	need_notify = False
 	balance_changed = False
 
-	for i, account in enumerate(accounts):
+	def record_result(i: int, account: AccountConfig, result) -> None:
+		nonlocal success_count
+		success, user_info_before, user_info_after = result
 		account_key = f'account_{i + 1}'
+		if success:
+			success_count += 1
+
+		if not success:
+			account_name = account.get_display_name(i)
+			print(f'[NOTIFY] {account_name} failed, will send notification')
+			failures_by_account.pop(account_key, None)
+			failures_by_account[account_key] = account_name
+
+		if user_info_after and user_info_after.get('success'):
+			current_quota = user_info_after['quota']
+			current_used = user_info_after['used_quota']
+			current_balances[account_key] = {'quota': current_quota, 'used': current_used}
+
+			if user_info_before and user_info_before.get('success'):
+				before_quota = user_info_before['quota']
+				before_used = user_info_before['used_quota']
+				after_quota = user_info_after['quota']
+				after_used = user_info_after['used_quota']
+				group = user_info_after.get('group') or user_info_before.get('group') or 'unknown'
+
+				total_before = before_quota + before_used
+				total_after = after_quota + after_used
+
+				check_in_reward = total_after - total_before
+				usage_increase = after_used - before_used
+				balance_change = after_quota - before_quota
+
+				account_check_in_details[account_key] = {
+					'name': account.get_display_name(i),
+					'group': group,
+					'before_quota': before_quota,
+					'before_used': before_used,
+					'after_quota': after_quota,
+					'after_used': after_used,
+					'check_in_reward': check_in_reward,
+					'usage_increase': usage_increase,
+					'balance_change': balance_change,
+					'success': success,
+				}
+		if success:
+			failures_by_account.pop(account_key, None)
+
+	async def process_account(i: int, account: AccountConfig):
 		try:
-			success, user_info_before, user_info_after = await check_in_account(account, i, app_config)
-			if success:
-				success_count += 1
-
-			should_notify_this_account = False
-
-			if not success:
-				should_notify_this_account = True
-				need_notify = True
-				account_name = account.get_display_name(i)
-				print(f'[NOTIFY] {account_name} failed, will send notification')
-
-			if user_info_after and user_info_after.get('success'):
-				current_quota = user_info_after['quota']
-				current_used = user_info_after['used_quota']
-				current_balances[account_key] = {'quota': current_quota, 'used': current_used}
-
-				if user_info_before and user_info_before.get('success'):
-					before_quota = user_info_before['quota']
-					before_used = user_info_before['used_quota']
-					after_quota = user_info_after['quota']
-					after_used = user_info_after['used_quota']
-					group = user_info_after.get('group') or user_info_before.get('group') or 'unknown'
-
-					total_before = before_quota + before_used
-					total_after = after_quota + after_used
-
-					check_in_reward = total_after - total_before
-					usage_increase = after_used - before_used
-					balance_change = after_quota - before_quota
-
-					account_check_in_details[account_key] = {
-						'name': account.get_display_name(i),
-						'group': group,
-						'before_quota': before_quota,
-						'before_used': before_used,
-						'after_quota': after_quota,
-						'after_used': after_used,
-						'check_in_reward': check_in_reward,
-						'usage_increase': usage_increase,
-						'balance_change': balance_change,
-						'success': success,
-					}
-
-			if should_notify_this_account:
-				account_name = account.get_display_name(i)
-				status = '[SUCCESS]' if success else '[FAIL]'
-				account_result = f'{status} {account_name}'
-				if user_info_after and user_info_after.get('success'):
-					account_result += f'\n{user_info_after["display"]}'
-				elif user_info_after:
-					account_result += f'\n{user_info_after.get("error", "Unknown error")}'
-				notification_content.append(account_result)
-
+			return await check_in_account(account, i, app_config)
 		except Exception as e:
 			account_name = account.get_display_name(i)
 			print(f'[FAILED] {account_name} processing exception: {e}')
-			need_notify = True
-			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
+			failures_by_account[f'account_{i + 1}'] = f'{account_name}\nException: {str(e)[:50]}...'
+			return False, None, None
+
+	failed_accounts = []
+	for i, account in account_schedule:
+		result = await process_account(i, account)
+		record_result(i, account, result)
+		if not result[0]:
+			failed_accounts.append((i, account))
+
+	if failed_accounts:
+		retry_delay = account_retry_delay_seconds()
+		print(
+			f'[RETRY] {len(failed_accounts)} account(s) failed. '
+			f'Retrying up to twice in {retry_delay}s: '
+			f'{", ".join(account.get_display_name(i) for i, account in failed_accounts)}'
+		)
+		retry_round = failed_accounts
+		for attempt in range(1, 2 + 1):
+			if retry_delay:
+				await asyncio.sleep(retry_delay)
+			next_round = []
+			for i, account in retry_round:
+				result = await process_account(i, account)
+				record_result(i, account, result)
+				if not result[0] and attempt < 2:
+					next_round.append((i, account))
+			retry_round = next_round
+			if not retry_round:
+				break
+			print(f'[RETRY] Attempt {attempt + 1}/2 for {len(retry_round)} account(s)')
+
+	for account_name in failures_by_account.values():
+		need_notify = True
+		notification_content.append(f'[FAIL] {account_name}\nRetry failed')
 
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
 	if current_balance_hash:
